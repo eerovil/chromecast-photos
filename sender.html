@@ -20,25 +20,17 @@
       <div>
         <button id="sign-in-or-out-button" style="margin-left: 25px">Sign In/Authorize</button>
         <button id="revoke-access-button" style="display: none; margin-left: 25px">Revoke access</button>
+        <button id="pick-photos-button" type="button" style="display: none; margin-left: 25px">Choose photos…</button>
 
         <div id="auth-status" style="display: inline; padding-left: 25px"></div>
       </div>
     </div>
     <hr>
 
-    <button id="send-data" style="margin-left: 25px">Send</button>
-
-    <div style="
-    display: flex;
-    width: 100%;
-    flex-wrap: wrap;">
-      <div v-for="album in albums" style="margin: 2rem;">
-      <a href="#" @click="selectAlbum(album); $event.preventDefault();">
-        <img style="width: 200px; height: 200px;" :src="album.coverPhotoBaseUrl" />
-        <p>{{ album.title }}</p>
-      </a>
-      </div>
-    </div>
+    <p v-if="pickedItems.length" style="color:#ccc;margin-left:25px;">
+      {{ pickedItems.length }} photo(s) ready to cast (max 2000 per session).
+    </p>
+    <button id="send-data" style="margin-left: 25px" :disabled="!pickedItems.length">Send to TV</button>
   </div>
   <script>
 
@@ -46,55 +38,8 @@
       el: "#vue-app",
 
       data: () => ({
-        apiToken: null,
-        albums: [{id: 'allMedia', title: 'Kaikki'}],
-        selectedAlbum: {},
+        pickedItems: [],
       }),
-
-      methods: {
-        selectAlbum(album) {
-          this.selectedAlbum = album;
-        },
-        async showAlbums() {
-          if (!this.apiToken) {
-            return;
-          }
-          this.albums = [{ id: 'allMedia', title: 'Kaikki' }];
-          const config = {
-            headers: { Authorization: `Bearer ${this.apiToken}` }
-          };
-
-          let pageToken = "";
-
-          while (pageToken === "" || !!pageToken) {
-            await axios.get(
-              `https://photoslibrary.googleapis.com/v1/albums?pageSize=50${pageToken}`,
-              config
-            ).then(resp => resp.data).then(data => {
-              pageToken = null;
-              if (data && data.nextPageToken) {
-                pageToken = `&pageToken=${data.nextPageToken}`
-              }
-              return data.albums;
-            }).then(albums => {
-              if (albums && albums.length) {
-                albums.forEach(album => {
-                  this.albums.push(album)
-                })
-              }
-              return albums
-            })
-          }
-
-          console.log(this.albums)
-        }
-      },
-
-      watch: {
-        apiToken() {
-          this.showAlbums();
-        }
-      }
     })
 
     initializeCastApi = function () {
@@ -110,40 +55,207 @@
       }
     };
 
-    function send() {
-      var textEl = document.getElementById("text");
-      sendText(textEl.value);
+    var CAST_NS = 'urn:x-cast:com.eerovil.chromecast-photos';
+    var CHUNK_ITEMS = 18;
+
+    function normalizePickerForReceiver(picked) {
+      var file = picked.mediaFile || {};
+      var meta = file.mediaFileMetadata || {};
+      return {
+        id: picked.id,
+        baseUrl: file.baseUrl || '',
+        mimeType: file.mimeType || '',
+        mediaMetadata: {
+          creationTime: picked.createTime || null,
+          width: meta.width,
+          height: meta.height,
+        },
+      };
     }
 
-    function sendText(txt) {
-      var castSession = cast.framework.CastContext.getInstance().getCurrentSession();
-      if (castSession) {
-        castSession.sendMessage('urn:x-cast:com.eerovil.chromecast-photos', {
-          type: "message",
-          text: txt
-        });
+    function parseDurationToMs(s) {
+      if (!s) return 2000;
+      var m = /^([0-9.]+)s$/.exec(s);
+      return m ? Math.max(500, parseFloat(m[1]) * 1000) : 2000;
+    }
+
+    function withAutoclosePickerUri(pickerUri) {
+      if (!pickerUri) return pickerUri;
+      try {
+        var u = new URL(pickerUri);
+        u.pathname = u.pathname.replace(/\/?$/, '') + '/autoclose';
+        return u.toString();
+      } catch (e) {
+        return pickerUri;
       }
     }
 
-    $('#send-data').click(function() {
+    function pollSessionUntilReady(sessionId, token) {
+      var deadline = Date.now() + 20 * 60 * 1000;
+      return new Promise(function (resolve, reject) {
+        function poll() {
+          if (Date.now() > deadline) {
+            reject(new Error('Picker timed out'));
+            return;
+          }
+          fetch('https://photospicker.googleapis.com/v1/sessions/' + encodeURIComponent(sessionId), {
+            headers: { Authorization: 'Bearer ' + token },
+          })
+            .then(function (r) {
+              return r.json().then(function (sess) {
+                if (!r.ok) throw sess.error || sess;
+                return sess;
+              });
+            })
+            .then(function (sess) {
+              if (sess.mediaItemsSet) {
+                resolve(sess);
+                return;
+              }
+              var interval = 2000;
+              if (sess.pollingConfig && sess.pollingConfig.pollInterval) {
+                interval = parseDurationToMs(sess.pollingConfig.pollInterval);
+              }
+              setTimeout(poll, interval);
+            })
+            .catch(reject);
+        }
+        poll();
+      });
+    }
+
+    function fetchAllPickedMediaItems(sessionId, token) {
+      var all = [];
+      function nextPage(pageToken) {
+        var url = 'https://photospicker.googleapis.com/v1/mediaItems?sessionId=' +
+          encodeURIComponent(sessionId) + '&pageSize=100';
+        if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+        return fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+          .then(function (r) {
+            return r.json().then(function (data) {
+              if (!r.ok) throw data.error || data;
+              return data;
+            });
+          })
+          .then(function (data) {
+            if (data.mediaItems && data.mediaItems.length) {
+              all = all.concat(data.mediaItems);
+            }
+            if (data.nextPageToken) return nextPage(data.nextPageToken);
+            return all;
+          });
+      }
+      return nextPage(null);
+    }
+
+    function deletePickerSession(sessionId, token) {
+      return fetch(
+        'https://photospicker.googleapis.com/v1/sessions/' + encodeURIComponent(sessionId),
+        { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } }
+      );
+    }
+
+    function startPickerFlow() {
+      var token = currentAccessToken;
+      if (!token) {
+        alert('Sign in first.');
+        return;
+      }
+      $('#pick-photos-button').prop('disabled', true);
+      $('#auth-status').html('<span style="color:#888">Opening Google Photos…</span>');
+
+      fetch('https://photospicker.googleapis.com/v1/sessions', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ pickingConfig: { maxItemCount: '2000' } }),
+      })
+        .then(function (r) {
+          return r.json().then(function (body) {
+            if (!r.ok) throw body.error || body;
+            return body;
+          });
+        })
+        .then(function (session) {
+          window.open(withAutoclosePickerUri(session.pickerUri), '_blank', 'noopener,noreferrer');
+          return pollSessionUntilReady(session.id, token).then(function () {
+            return session.id;
+          });
+        })
+        .then(function (sessionId) {
+          return fetchAllPickedMediaItems(sessionId, token).then(function (items) {
+            return { sessionId: sessionId, items: items };
+          });
+        })
+        .then(function (result) {
+          return deletePickerSession(result.sessionId, token).then(function () {
+            return result.items;
+          });
+        })
+        .then(function (items) {
+          var vue = document.querySelector('#vue-app').__vue__;
+          vue.pickedItems = items.map(normalizePickerForReceiver);
+          $('#auth-status').html(
+            '<span style="color:#888">' + vue.pickedItems.length + ' item(s) selected.</span>'
+          );
+        })
+        .catch(function (e) {
+          console.error(e);
+          alert('Picker error: ' + ((e && e.message) || JSON.stringify(e)));
+        })
+        .then(function () {
+          $('#pick-photos-button').prop('disabled', false);
+        });
+    }
+
+    function sleep(ms) {
+      return new Promise(function (r) {
+        setTimeout(r, ms);
+      });
+    }
+
+    $('#send-data').click(async function () {
       var vue = document.querySelector('#vue-app').__vue__;
       var castSession = cast.framework.CastContext.getInstance().getCurrentSession();
-      var sel = vue.selectedAlbum;
-      var albumToSend = (sel && sel.id) ? [sel.id] : ['allMedia'];
-      console.log('Sending album ids:', albumToSend);
-      if (castSession) {
-        castSession.sendMessage('urn:x-cast:com.eerovil.chromecast-photos', {
-          type: "apiToken",
-          text: vue.apiToken,
-        });
-        castSession.sendMessage('urn:x-cast:com.eerovil.chromecast-photos', {
-          type: "album",
-          text: JSON.stringify(albumToSend),
-        });
+      var items = vue.pickedItems || [];
+      if (!castSession) {
+        alert('Connect to a Cast device first.');
+        return;
       }
-    })
+      if (!items.length || !currentAccessToken) {
+        alert('Sign in and choose photos first.');
+        return;
+      }
 
-    var SCOPE = 'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata';
+      castSession.sendMessage(CAST_NS, {
+        type: 'apiToken',
+        text: currentAccessToken,
+      });
+
+      var chunks = [];
+      for (var i = 0; i < items.length; i += CHUNK_ITEMS) {
+        chunks.push(items.slice(i, i + CHUNK_ITEMS));
+      }
+      if (chunks.length === 0) return;
+
+      castSession.sendMessage(CAST_NS, {
+        type: 'pickedMediaStart',
+        text: JSON.stringify({ totalChunks: chunks.length }),
+      });
+      await sleep(80);
+
+      for (var c = 0; c < chunks.length; c++) {
+        castSession.sendMessage(CAST_NS, {
+          type: 'pickedMediaChunk',
+          text: JSON.stringify({ index: c, items: chunks[c] }),
+        });
+        await sleep(80);
+      }
+    });
+
+    var SCOPE = 'https://www.googleapis.com/auth/photospicker.mediaitems.readonly';
     var CLIENT_ID = '739631035531-tke7j1166gqm1v5q2lamlo5l6ltf52v3.apps.googleusercontent.com';
 
     var tokenClient = null;
@@ -154,18 +266,18 @@
       if (currentAccessToken) {
         $('#sign-in-or-out-button').html('Sign out');
         $('#revoke-access-button').css('display', 'inline-block');
+        $('#pick-photos-button').css('display', 'inline-block');
         $('#auth-status').html(
-          'Signed in. Album list uses Library API (app-created albums per Google Photos policy).'
+          'Signed in. Use “Choose photos…” then “Send to TV”.'
         );
-        vue.apiToken = currentAccessToken;
       } else {
         $('#sign-in-or-out-button').html('Sign In/Authorize');
         $('#revoke-access-button').css('display', 'none');
+        $('#pick-photos-button').css('display', 'none');
         $('#auth-status').html(
           'You have not authorized this app or you are signed out.'
         );
-        vue.apiToken = null;
-        vue.albums = [{ id: 'allMedia', title: 'Kaikki' }];
+        vue.pickedItems = [];
       }
     }
 
@@ -187,6 +299,7 @@
 
       $('#sign-in-or-out-button').on('click', handleAuthClick);
       $('#revoke-access-button').on('click', revokeAccess);
+      $('#pick-photos-button').on('click', startPickerFlow);
       applyAuthUi();
     }
 

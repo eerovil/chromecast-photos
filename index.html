@@ -72,8 +72,78 @@ var images = [];
 var videos = [];
 var hiddenMediaIds = new Set();
 var albums = [];
+var hiddenAlbums = [];
 var fetchPageTimeout = null;
 var player = document.querySelector("#castMediaElement")
+
+// Google Photos Picker catalog (chunked from sender); when true, skip Library API fetchPage.
+var pickerMode = false;
+var pickerChunkTotal = 0;
+var pickerChunks = {};
+var playbackStarted = false;
+
+function ensurePlaybackStarted() {
+    if (playbackStarted) return;
+    if (!apiToken) return;
+    if (pickerMode) {
+        if (images.length === 0 && videos.length === 0) return;
+    } else {
+        if (albums.length === 0) return;
+    }
+    playbackStarted = true;
+    document.querySelector("#message").innerHTML = "";
+    initBoxes();
+    for (let box of boxes) {
+        fetchNext(box);
+    }
+    mainLoop();
+    if (!pickerMode && albums.length > 0) {
+        fetchPage();
+    }
+}
+
+function applyPickerChunksComplete() {
+    var merged = [];
+    for (var i = 0; i < pickerChunkTotal; i++) {
+        var part = pickerChunks[i];
+        if (part && part.length) {
+            merged = merged.concat(part);
+        }
+    }
+    pickerChunks = {};
+    revokeAllFetchedBlobs();
+    images = [];
+    videos = [];
+    merged.forEach(function (m) {
+        if (!m || !m.mimeType) return;
+        if (hiddenMediaIds.has(m.id)) return;
+        if (m.mimeType.indexOf("video") === 0) {
+            videos.push(m);
+        } else {
+            images.push(m);
+        }
+    });
+    pickerMode = true;
+    albums = [];
+    if (fetchPageTimeout) {
+        clearTimeout(fetchPageTimeout);
+        fetchPageTimeout = null;
+    }
+    if (playbackStarted) {
+        boxes.forEach(function (b) {
+            b.currMedia = null;
+            b.nextMedia = null;
+            b.prevChange = null;
+            b.nextMediaReady = true;
+        });
+        for (let box of boxes) {
+            fetchNext(box);
+        }
+    } else {
+        ensurePlaybackStarted();
+    }
+    log("Picker catalog applied: " + images.length + " images, " + videos.length + " videos");
+}
 
 if (window.location.href.indexOf('localhost') == -1) {
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -88,12 +158,53 @@ if (window.location.href.indexOf('localhost') == -1) {
         if (customEvent.data.type == "apiToken") {
             console.log("Got api token!")
             apiToken = customEvent.data.text;
+            ensurePlaybackStarted();
         }
-        if (customEvent.data.type == "albums") {
+        if (customEvent.data.type == "pickedMediaStart") {
+            try {
+                var start = JSON.parse(customEvent.data.text);
+                pickerChunkTotal = start.totalChunks || 0;
+                pickerChunks = {};
+                pickerMode = true;
+                revokeAllFetchedBlobs();
+                images = [];
+                videos = [];
+                if (fetchPageTimeout) {
+                    clearTimeout(fetchPageTimeout);
+                    fetchPageTimeout = null;
+                }
+                albums = [];
+                log("Expecting " + pickerChunkTotal + " picker chunk(s)");
+            } catch (e) {
+                log("pickedMediaStart parse error " + e);
+            }
+        }
+        if (customEvent.data.type == "pickedMediaChunk") {
+            try {
+                var chunk = JSON.parse(customEvent.data.text);
+                var idx = chunk.index;
+                pickerChunks[idx] = chunk.items || [];
+                var allIn = true;
+                for (var k = 0; k < pickerChunkTotal; k++) {
+                    if (!Object.prototype.hasOwnProperty.call(pickerChunks, k)) {
+                        allIn = false;
+                        break;
+                    }
+                }
+                if (pickerChunkTotal > 0 && allIn) {
+                    applyPickerChunksComplete();
+                }
+            } catch (e) {
+                log("pickedMediaChunk error " + e);
+            }
+        }
+        if (customEvent.data.type == "albums" || customEvent.data.type == "album") {
+            pickerMode = false;
             albums = JSON.parse(customEvent.data.text).map(albumId => ({id: albumId}));
             console.log("Got albums:", albums)
             images = [];
             videos = [];
+            ensurePlaybackStarted();
         }
         if (customEvent.data.type == "hiddenAlbums") {
             hiddenAlbums = JSON.parse(customEvent.data.text).map(albumId => ({id: albumId}));
@@ -145,14 +256,6 @@ function initBoxes() {
         },
     ]
 
-    player.addEventListener('canplaythrough', function (event) {
-        let box = boxes[1];
-        if (box.nextMedia) {
-            box.nextMediaReady = true;
-            log("Box " + box.id + " video nextMediaReady.")
-        }
-    });
-
     player.addEventListener('error', function (event) {
         let box = boxes[1];
         if (box.nextMedia) {
@@ -168,22 +271,70 @@ function buildFullUrl(mediaItem) {
     return mediaItem.baseUrl + "=w2048-h1024";
 }
 
-function preloadMediaItem(box) {
-    if (box.nextMedia.mimeType.indexOf('image/') === 0) {
-        (new Image()).src = buildFullUrl(box.nextMedia);
-        box.nextMediaReady = true;
-        log("Box " + box.id + " (image) nextMedia = " + box.nextMedia.id)
-    } else if (box.nextMedia.mimeType.indexOf('video/') === 0) {
-        // Load video in background
-        const boxEl = document.querySelector('#' + box.id)
-        player.setAttribute('loop', '')
-        player.setAttribute('src', box.nextMedia.baseUrl + "=dv")
-        player.setAttribute('type', box.nextMedia.mimeType)
-        player.load()
-        box.nextMediaReady = true;
-        const nextMediaId = box.nextMedia.id
-        log("Box " + box.id + " (video) nextMedia = " + nextMediaId)
+function revokeMediaBlobUrl(url) {
+    if (url && String(url).indexOf('blob:') === 0) {
+        try { URL.revokeObjectURL(url); } catch (e) {}
+    }
+}
 
+// Google Photos base URLs require Authorization; <img>/<video> cannot send Bearer → 403 without this.
+function fetchAuthBlobUrl(fullUrl, token) {
+    return fetch(fullUrl, { headers: { Authorization: 'Bearer ' + token } })
+        .then(function (r) {
+            if (!r.ok) {
+                return r.text().then(function (t) {
+                    throw new Error('Media ' + r.status + ' ' + (t || ''));
+                });
+            }
+            return r.blob();
+        })
+        .then(function (blob) {
+            return URL.createObjectURL(blob);
+        });
+}
+
+function preloadMediaItem(box) {
+    var m = box.nextMedia;
+    box.nextMediaReady = false;
+    if (!m || !apiToken) {
+        box.nextMediaReady = true;
+        return;
+    }
+    if (m.mimeType.indexOf('image/') === 0) {
+        fetchAuthBlobUrl(buildFullUrl(m), apiToken)
+            .then(function (blobUrl) {
+                revokeMediaBlobUrl(m._blobUrl);
+                m._blobUrl = blobUrl;
+                box.nextMediaReady = true;
+                log("Box " + box.id + " (image) nextMedia = " + m.id);
+            })
+            .catch(function (e) {
+                log("preload image " + e);
+                m.error = true;
+                box.nextMediaReady = true;
+            });
+    } else if (m.mimeType.indexOf('video/') === 0) {
+        fetchAuthBlobUrl(m.baseUrl + "=dv", apiToken)
+            .then(function (blobUrl) {
+                revokeMediaBlobUrl(m._blobUrl);
+                m._blobUrl = blobUrl;
+                player.setAttribute('loop', '');
+                player.src = blobUrl;
+                player.load();
+                var onReady = function () {
+                    box.nextMediaReady = true;
+                    player.removeEventListener('canplaythrough', onReady);
+                    log("Box " + box.id + " (video) nextMedia = " + m.id);
+                };
+                player.addEventListener('canplaythrough', onReady);
+            })
+            .catch(function (e) {
+                log("preload video " + e);
+                m.error = true;
+                box.nextMediaReady = true;
+            });
+    } else {
+        box.nextMediaReady = true;
     }
 }
 
@@ -240,25 +391,46 @@ function mainLoop() {
             if (box.nextMediaReady) {
                 box.currMedia = box.nextMedia;
                 const infoEl = document.querySelector("#" + box.id + " .info");
-                infoEl.innerHTML = "";
-                if (box.currMedia && box.currMedia.mediaMetadata && box.currMedia.mediaMetadata.creationTime) {
-                    infoEl.innerHTML = (new Date(box.currMedia.mediaMetadata.creationTime)).toLocaleDateString('fi');
+                if (infoEl) {
+                    infoEl.innerHTML = "";
+                    if (box.currMedia && box.currMedia.mediaMetadata && box.currMedia.mediaMetadata.creationTime) {
+                        infoEl.innerHTML = (new Date(box.currMedia.mediaMetadata.creationTime)).toLocaleDateString('fi');
+                    }
                 }
                 box.nextMedia = null;
                 box.prevChange = new Date();
                 let imageEl = document.querySelector("#" + box.id + " .img")
                 if (box.currMedia.mimeType.indexOf('video/') === 0) {
                     log("Displaying video for box " + box.id)
-                    imageEl.style.display = "none";
+                    if (imageEl) {
+                        imageEl.style.display = "none";
+                    }
                     player.style.display = 'inline';
-                    const aspectRatio = (box.currMedia.mediaMetadata.width / box.currMedia.mediaMetadata.height);
+                    var mw = (box.currMedia.mediaMetadata && box.currMedia.mediaMetadata.width) || 1920;
+                    var mh = (box.currMedia.mediaMetadata && box.currMedia.mediaMetadata.height) || 1080;
+                    const aspectRatio = mw / mh;
                     player.style.width = `${window.innerHeight * aspectRatio}px`
+                    if (box.currMedia._blobUrl) {
+                        player.src = box.currMedia._blobUrl;
+                    }
                     player.play()
                     console.log(box.currMedia)
                 } else {
                     log("Displaying image for box " + box.id)
+                    if (!imageEl) {
+                        fetchNext(box);
+                        continue;
+                    }
                     imageEl.style.display = "inline";
-                    imageEl.setAttribute('src', buildFullUrl(box.currMedia))
+                    if (box.currMedia._blobUrl) {
+                        imageEl.src = box.currMedia._blobUrl;
+                    } else if (apiToken) {
+                        fetchAuthBlobUrl(buildFullUrl(box.currMedia), apiToken).then(function (u) {
+                            revokeMediaBlobUrl(imageEl._displayBlob);
+                            imageEl._displayBlob = u;
+                            imageEl.src = u;
+                        }).catch(function (e) { log(e); });
+                    }
                     if (box.id == "right") {
                         player.style.display = 'none';
                         player.pause();
@@ -281,6 +453,9 @@ function mainLoop() {
 }
 
 function fetchPage() {
+    if (pickerMode) {
+        return;
+    }
     // Fetch a single page from all albums, then wait a bit and do it again.
     const config = {
         headers: { Authorization: `Bearer ${apiToken}` }
@@ -313,6 +488,9 @@ function fetchPage() {
             )
         }
         axiosPromise.then(resp => {
+            if (!resp.data || !resp.data.mediaItems) {
+                return;
+            }
             album.pageToken = resp.data.nextPageToken;
             if (!album.pageToken) {
                 album.pageToken = "stop";
@@ -344,6 +522,9 @@ function fetchPage() {
             },
             config
         ).then(resp => {
+            if (!resp.data || !resp.data.mediaItems) {
+                return;
+            }
             album.pageToken = resp.data.nextPageToken;
             if (!album.pageToken) {
                 album.pageToken = "stop";
@@ -354,47 +535,67 @@ function fetchPage() {
         })
     }
     // Wait longer for multiple albums to keep quota better
-    fetchPageTimeout = setTimeout(fetchPage, 10 * 1000 * albums.length);
+    var albumCount = Math.max(1, albums.length + hiddenAlbums.length);
+    fetchPageTimeout = setTimeout(fetchPage, 10 * 1000 * albumCount);
 }
-
-waitForApiToken = new Promise((resolve, reject) => {
-    const checkApiToken = function() {
-        if (apiToken && albums.length > 0) {
-            document.querySelector("#message").innerHTML = ""
-            resolve()
-        } else {
-            setTimeout(checkApiToken, 500)
-        }
-    }
-    checkApiToken()
-});
-
-waitForApiToken.then(() => {
-    initBoxes();
-    for (let box of boxes) {
-        fetchNext(box)
-    }
-    mainLoop()
-    fetchPage()
-})
 
 window.setData = function(_apiToken, _albums, _hiddens) {
     apiToken = _apiToken;
     albums = _albums;
     hiddenAlbums = _hiddens || [];
+    pickerMode = false;
+    ensurePlaybackStarted();
+}
+
+// Localhost / tests: pass token + normalized media items (same shape as picker chunks merged).
+window.setPickerCatalog = function (_apiToken, items) {
+    apiToken = _apiToken;
+    pickerMode = true;
+    albums = [];
+    revokeAllFetchedBlobs();
+    images = [];
+    videos = [];
+    (items || []).forEach(function (m) {
+        if (!m || !m.mimeType) return;
+        if (m.mimeType.indexOf("video") === 0) {
+            videos.push(m);
+        } else {
+            images.push(m);
+        }
+    });
+    playbackStarted = false;
+    ensurePlaybackStarted();
+}
+
+function revokeAllFetchedBlobs() {
+    function wipe(arr) {
+        (arr || []).forEach(function (m) {
+            revokeMediaBlobUrl(m._blobUrl);
+            m._blobUrl = null;
+        });
+    }
+    wipe(images);
+    wipe(videos);
 }
 
 window.resetData = function() {
+    revokeAllFetchedBlobs();
     images = [];
     videos = [];
     // Clear pageToken
     albums.forEach(album => {
         album.pageToken = null;
     })
+    hiddenAlbums.forEach(album => {
+        album.pageToken = null;
+    })
     if (fetchPageTimeout){
         clearTimeout(fetchPageTimeout)
+        fetchPageTimeout = null;
     }
-    fetchPage();
+    if (!pickerMode) {
+        fetchPage();
+    }
 }
 
 // empty arrays every 25min
