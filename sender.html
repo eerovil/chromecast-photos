@@ -2,6 +2,32 @@
 
 <head>
   <title>Start</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+    #vue-app .pick-toolbar button { margin-right: 8px; margin-bottom: 8px; cursor: pointer; }
+    #vue-app .pick-grid {
+      display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 25px;
+      max-height: 55vh; overflow: auto; align-content: flex-start;
+    }
+    #vue-app .pick-tile {
+      width: 128px; border: 1px solid #444; border-radius: 6px; padding: 6px;
+      background: #1a1a1a; user-select: none;
+    }
+    #vue-app .pick-tile.selected { border-color: #6b9fff; background: #222a38; }
+    #vue-app .tile-thumb {
+      width: 100%; height: 100px; border-radius: 4px; overflow: hidden;
+      background: #0d0d0d; cursor: pointer; margin-bottom: 6px;
+    }
+    #vue-app .tile-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #vue-app .tile-thumb-loading, #vue-app .tile-thumb-fail {
+      height: 100%; display: flex; align-items: center; justify-content: center;
+      color: #666; font-size: 12px;
+    }
+    #vue-app .tile-batch { display: block; font-size: 10px; color: #888; cursor: pointer; margin-bottom: 4px; }
+    #vue-app .tile-batch input { margin-right: 4px; vertical-align: middle; }
+    #vue-app .pick-tile .tile-label { color: #bbb; font-size: 11px; line-height: 1.35; word-break: break-all; }
+  </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/0.21.1/axios.min.js"
     integrity="sha512-bZS47S7sPOxkjU/4Bt0zrhEtWx0y0CRkhEp8IckzK+ltifIIE9EMIMTuT/mEzoIMewUINruDBIR/jJnbguonqQ=="
     crossorigin="anonymous"></script>
@@ -28,9 +54,43 @@
     <hr>
 
     <p v-if="pickedItems.length" style="color:#ccc;margin-left:25px;">
-      {{ pickedItems.length }} photo(s) ready to cast (max 2000 per session).
+      Tap a preview to show that item on TV now. Use “Include in batch” + Send for multiple (max 2000 per session).
     </p>
-    <button id="send-data" style="margin-left: 25px" :disabled="!pickedItems.length">Send to TV</button>
+    <div class="pick-toolbar" v-if="pickedItems.length" style="margin-left:25px;">
+      <button type="button" @click="selectAll">Select all</button>
+      <button type="button" @click="selectNone">Select none</button>
+      <span style="color:#aaa;margin-left:12px;">{{ selectedCount }} selected for TV</span>
+    </div>
+    <div class="pick-grid" v-if="pickedItems.length">
+      <div
+        v-for="(item, idx) in pickedItems"
+        :key="item.id"
+        class="pick-tile"
+        :class="{ selected: selected[idx] }"
+      >
+        <div
+          class="tile-thumb"
+          role="button"
+          tabindex="0"
+          title="Show on TV"
+          @click="castSingle(item)"
+          @keydown.enter.prevent="castSingle(item)"
+        >
+          <img v-if="item.previewUrl" :src="item.previewUrl" alt="" />
+          <div v-else-if="item.previewError" class="tile-thumb-fail">—</div>
+          <div v-else class="tile-thumb-loading">…</div>
+        </div>
+        <label class="tile-batch" @click.stop>
+          <input type="checkbox" v-model="selected[idx]" />
+          <span>Include in batch</span>
+        </label>
+        <div class="tile-label">
+          <strong>{{ itemKind(item) }} {{ idx + 1 }}</strong><br />
+          {{ shortId(item) }}
+        </div>
+      </div>
+    </div>
+    <button id="send-data" style="margin-left: 25px" :disabled="!pickedItems.length || selectedCount === 0">Send to TV</button>
   </div>
   <script>
 
@@ -39,7 +99,79 @@
 
       data: () => ({
         pickedItems: [],
+        selected: [],
       }),
+
+      computed: {
+        selectedCount: function () {
+          return this.selected.filter(Boolean).length;
+        },
+        itemsToSend: function () {
+          var self = this;
+          return this.pickedItems.filter(function (_, i) {
+            return self.selected[i];
+          });
+        },
+      },
+
+      methods: {
+        selectAll: function () {
+          this.selected = this.pickedItems.map(function () { return true; });
+        },
+        selectNone: function () {
+          this.selected = this.pickedItems.map(function () { return false; });
+        },
+        itemKind: function (item) {
+          return item.mimeType && item.mimeType.indexOf('video') === 0 ? 'Video' : 'Photo';
+        },
+        shortId: function (item) {
+          if (!item || !item.id) return '';
+          return item.id.length > 12 ? '…' + item.id.slice(-10) : item.id;
+        },
+        castSingle: function (item) {
+          if (!currentAccessToken) {
+            alert('Sign in first.');
+            return;
+          }
+          sendItemsToCast([item]);
+        },
+        loadPreviews: function () {
+          var self = this;
+          var token = currentAccessToken;
+          if (!token || !this.pickedItems.length) {
+            return;
+          }
+          var list = this.pickedItems;
+          var BATCH = 6;
+          function loadBatch(start) {
+            if (start >= list.length) {
+              return Promise.resolve();
+            }
+            var slice = list.slice(start, start + BATCH);
+            return Promise.all(
+              slice.map(function (item) {
+                if (!item.baseUrl) {
+                  return Promise.resolve();
+                }
+                var url =
+                  item.mimeType && item.mimeType.indexOf('video') === 0
+                    ? item.baseUrl + '=w120-h120-no'
+                    : item.baseUrl + '=w120-h120-c';
+                return fetchAuthBlobUrl(url, token)
+                  .then(function (blobUrl) {
+                    self.$set(item, 'previewUrl', blobUrl);
+                  })
+                  .catch(function () {
+                    self.$set(item, 'previewError', true);
+                  });
+              })
+            ).then(function () {
+              return loadBatch(start + BATCH);
+            });
+          }
+          loadBatch(0);
+        },
+      },
     })
 
     initializeCastApi = function () {
@@ -57,6 +189,63 @@
 
     var CAST_NS = 'urn:x-cast:com.eerovil.chromecast-photos';
     var CHUNK_ITEMS = 18;
+
+    function fetchAuthBlobUrl(fullUrl, token) {
+      return fetch(fullUrl, { headers: { Authorization: 'Bearer ' + token } })
+        .then(function (r) {
+          if (!r.ok) {
+            return r.text().then(function (t) {
+              throw new Error('Media ' + r.status + ' ' + (t || ''));
+            });
+          }
+          return r.blob();
+        })
+        .then(function (blob) {
+          return URL.createObjectURL(blob);
+        });
+    }
+
+    function revokePickedItemPreviews(items) {
+      (items || []).forEach(function (item) {
+        if (item.previewUrl && String(item.previewUrl).indexOf('blob:') === 0) {
+          try { URL.revokeObjectURL(item.previewUrl); } catch (e) {}
+        }
+      });
+    }
+
+    async function sendItemsToCast(items) {
+      if (!items || !items.length || !currentAccessToken) {
+        return;
+      }
+      var castSession = cast.framework.CastContext.getInstance().getCurrentSession();
+      if (!castSession) {
+        alert('Connect to a Cast device first.');
+        return;
+      }
+      castSession.sendMessage(CAST_NS, {
+        type: 'apiToken',
+        text: currentAccessToken,
+      });
+      var chunks = [];
+      for (var i = 0; i < items.length; i += CHUNK_ITEMS) {
+        chunks.push(items.slice(i, i + CHUNK_ITEMS));
+      }
+      if (chunks.length === 0) {
+        return;
+      }
+      castSession.sendMessage(CAST_NS, {
+        type: 'pickedMediaStart',
+        text: JSON.stringify({ totalChunks: chunks.length }),
+      });
+      await sleep(80);
+      for (var c = 0; c < chunks.length; c++) {
+        castSession.sendMessage(CAST_NS, {
+          type: 'pickedMediaChunk',
+          text: JSON.stringify({ index: c, items: chunks[c] }),
+        });
+        await sleep(80);
+      }
+    }
 
     function normalizePickerForReceiver(picked) {
       var file = picked.mediaFile || {};
@@ -196,10 +385,15 @@
         })
         .then(function (items) {
           var vue = document.querySelector('#vue-app').__vue__;
+          revokePickedItemPreviews(vue.pickedItems);
           vue.pickedItems = items.map(normalizePickerForReceiver);
+          vue.selected = vue.pickedItems.map(function () { return true; });
           $('#auth-status').html(
-            '<span style="color:#888">' + vue.pickedItems.length + ' item(s) selected.</span>'
+            '<span style="color:#888">' + vue.pickedItems.length + ' item(s) — tap preview for TV, or batch + Send.</span>'
           );
+          vue.$nextTick(function () {
+            vue.loadPreviews();
+          });
         })
         .catch(function (e) {
           console.error(e);
@@ -218,41 +412,12 @@
 
     $('#send-data').click(async function () {
       var vue = document.querySelector('#vue-app').__vue__;
-      var castSession = cast.framework.CastContext.getInstance().getCurrentSession();
-      var items = vue.pickedItems || [];
-      if (!castSession) {
-        alert('Connect to a Cast device first.');
-        return;
-      }
+      var items = vue.itemsToSend || [];
       if (!items.length || !currentAccessToken) {
-        alert('Sign in and choose photos first.');
+        alert('Tick “Include in batch” for at least one item, or tap a preview to cast one.');
         return;
       }
-
-      castSession.sendMessage(CAST_NS, {
-        type: 'apiToken',
-        text: currentAccessToken,
-      });
-
-      var chunks = [];
-      for (var i = 0; i < items.length; i += CHUNK_ITEMS) {
-        chunks.push(items.slice(i, i + CHUNK_ITEMS));
-      }
-      if (chunks.length === 0) return;
-
-      castSession.sendMessage(CAST_NS, {
-        type: 'pickedMediaStart',
-        text: JSON.stringify({ totalChunks: chunks.length }),
-      });
-      await sleep(80);
-
-      for (var c = 0; c < chunks.length; c++) {
-        castSession.sendMessage(CAST_NS, {
-          type: 'pickedMediaChunk',
-          text: JSON.stringify({ index: c, items: chunks[c] }),
-        });
-        await sleep(80);
-      }
+      await sendItemsToCast(items);
     });
 
     var SCOPE = 'https://www.googleapis.com/auth/photospicker.mediaitems.readonly';
@@ -268,7 +433,7 @@
         $('#revoke-access-button').css('display', 'inline-block');
         $('#pick-photos-button').css('display', 'inline-block');
         $('#auth-status').html(
-          'Signed in. Use “Choose photos…” then “Send to TV”.'
+          'Signed in. “Choose photos…”, tap a preview for TV, or batch + Send.'
         );
       } else {
         $('#sign-in-or-out-button').html('Sign In/Authorize');
@@ -277,7 +442,9 @@
         $('#auth-status').html(
           'You have not authorized this app or you are signed out.'
         );
+        revokePickedItemPreviews(vue.pickedItems);
         vue.pickedItems = [];
+        vue.selected = [];
       }
     }
 
